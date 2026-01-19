@@ -17,9 +17,121 @@ class ExcelLoader:
     """Load and validate transaction data from Excel files."""
 
     # Default sheet names to look for
-    DEFAULT_TRANSACTION_SHEETS = ["Transactions", "transactions", "Trans", "trades", "Trades"]
+    DEFAULT_TRANSACTION_SHEETS = ["Transactions", "transactions", "Trans", "trades", "Trades", "Template", "template", "Data", "data"]
     DEFAULT_POSITION_SHEETS = ["Positions", "positions", "Holdings", "holdings"]
     DEFAULT_EXPECTED_SHEETS = ["Expected", "expected", "PMS", "pms"]
+
+    # Column name mappings (source -> target)
+    COLUMN_MAPPINGS = {
+        # Date columns
+        "trade date": "transaction_date",
+        "trade_date": "transaction_date",
+        "effective date": "transaction_date",
+        "effective_date": "transaction_date",
+        "date": "transaction_date",
+        "settlement date": "settlement_date",
+        "settlement_date": "settlement_date",
+        # Transaction type
+        "transaction type": "transaction_type",
+        "trans type": "transaction_type",
+        "type": "transaction_type",
+        "txn_type": "transaction_type",
+        # Symbol/Instrument
+        "instrument id": "symbol",
+        "instrument_id": "symbol",
+        "instrument": "symbol",
+        "ticker": "symbol",
+        "security": "symbol",
+        "isin": "symbol",
+        "cusip": "symbol",
+        # Quantity
+        "qty": "quantity",
+        "shares": "quantity",
+        "units": "quantity",
+        "nominal": "quantity",
+        # Currency
+        "trade ccy": "currency",
+        "trade_ccy": "currency",
+        "local ccy": "currency",
+        "local_ccy": "currency",
+        "ccy": "currency",
+        # Amount/Value fields
+        "trade amount": "gross_amount",
+        "trade_amount": "gross_amount",
+        "trade gross value": "gross_amount",
+        "trade net value": "net_amount",
+        "trade_net_value": "net_amount",
+        # FX
+        "local fx rate": "fx_rate",
+        "local_fx_rate": "fx_rate",
+        "base fx rate": "base_fx_rate",
+        "fx rate": "fx_rate",
+        # Account
+        "account id": "account_id",
+        "account_id": "account_id",
+        "account name": "account_name",
+        # Fees
+        "trade expense": "fees",
+        "trade_expense": "fees",
+        "other charges": "other_fees",
+        "stamp duty": "stamp_duty",
+        "clearance fee": "clearance_fee",
+        "exchange fee": "exchange_fee",
+        # P&L
+        "realised pnl (local)": "realized_pnl_local",
+        "realised pnl (base)": "realized_pnl_base",
+        "realised_pnl": "realized_pnl",
+        # Income
+        "trade income": "income",
+        "accrued income": "accrued_interest",
+    }
+
+    # Transaction type mappings for common PMS formats
+    TRANSACTION_TYPE_ALIASES = {
+        "div": "dividend",
+        "wtax": "fee",  # Withholding tax
+        "buy": "buy",
+        "sell": "sell",
+        "pur": "buy",  # Purchase
+        "sal": "sell",  # Sale
+        "dep": "deposit",
+        "wth": "withdrawal",
+        "int": "interest",
+        "cpn": "coupon",
+        "fee": "fee",
+        "com": "commission",
+        "xfr": "transfer_in",
+        "tfr": "transfer_out",
+        # Additional PMS transaction types
+        "intrecd": "interest",  # Interest Received
+        "intpaid": "fee",  # Interest Paid (expense)
+        "subs": "buy",  # Subscription/Purchase
+        "red": "sell",  # Redemption
+        "redem": "sell",  # Redemption
+        "purchase": "buy",
+        "sale": "sell",
+        "dividend": "dividend",
+        "interest": "interest",
+        "coupon": "coupon",
+        "deposit": "deposit",
+        "withdrawal": "withdrawal",
+        "mfee": "fee",  # Management fee
+        "mgmtfee": "fee",  # Management fee
+        "pfee": "fee",  # Performance fee
+        "custfee": "fee",  # Custody fee
+        "brkfee": "commission",  # Brokerage fee
+        "tax": "fee",  # Tax
+        "stax": "fee",  # Stamp tax
+        "cgains": "sell",  # Capital gains distribution
+        "spinoff": "transfer_in",  # Spin-off
+        "merger": "transfer_in",  # Merger
+        "split": "stock_split",  # Stock split
+        "rights": "buy",  # Rights issue
+        "bonus": "dividend",  # Bonus shares
+        "corpact": "transfer_in",  # Corporate action
+        "ati": "interest",  # Accrued Tax Interest
+        "rtax": "fee",  # Reclaim Tax / Tax Refund
+    }
 
     def __init__(self, validator: Optional[DataValidator] = None):
         """
@@ -124,10 +236,40 @@ class ExcelLoader:
 
         return None
 
+    def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize column names using mapping."""
+        # Create a new column mapping for this dataframe
+        rename_map = {}
+        for col in df.columns:
+            col_lower = str(col).lower().strip()
+            if col_lower in self.COLUMN_MAPPINGS:
+                rename_map[col] = self.COLUMN_MAPPINGS[col_lower]
+            else:
+                # Also try with underscores instead of spaces
+                col_underscore = col_lower.replace(" ", "_")
+                if col_underscore in self.COLUMN_MAPPINGS:
+                    rename_map[col] = self.COLUMN_MAPPINGS[col_underscore]
+
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+        return df
+
+    def _normalize_transaction_type(self, txn_type: str) -> str:
+        """Normalize transaction type using aliases."""
+        if not txn_type:
+            return txn_type
+        txn_lower = str(txn_type).lower().strip()
+        return self.TRANSACTION_TYPE_ALIASES.get(txn_lower, txn_type)
+
     def _load_transactions(self, excel_file: pd.ExcelFile, sheet_name: str) -> None:
         """Load transactions from specified sheet."""
         try:
             df = pd.read_excel(excel_file, sheet_name=sheet_name)
+
+            # Normalize column names
+            df = self._normalize_columns(df)
+
             self.raw_data["transactions"] = df
 
             # Convert to list of dicts
@@ -137,7 +279,12 @@ class ExcelLoader:
                 self.validation_result.add_error("sheet", f"Transaction sheet '{sheet_name}' is empty")
                 return
 
-            # Validate schema
+            # Normalize transaction types in rows
+            for row in rows:
+                if "transaction_type" in row:
+                    row["transaction_type"] = self._normalize_transaction_type(row["transaction_type"])
+
+            # Validate schema with normalized columns
             columns = set(df.columns)
             schema_result = self.validator.validate_schema(columns)
             self.validation_result.merge(schema_result)
