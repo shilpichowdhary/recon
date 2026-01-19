@@ -323,27 +323,45 @@ def display_results(result):
     # Overall status
     st.header("📊 Reconciliation Results")
 
-    # Status banner
-    if recon.is_fully_reconciled:
-        st.success("✅ **PASS** - All reconciliation checks passed")
-    else:
-        st.error(f"❌ **FAIL** - {summary['failed']} check(s) failed")
+    # Check if we have comparison data
+    has_comparison = summary['total_checks'] > 0
 
-    # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Checks", summary['total_checks'])
-    with col2:
-        st.metric("Passed", summary['passed'], delta=None)
-    with col3:
-        st.metric("Failed", summary['failed'], delta=None, delta_color="inverse")
-    with col4:
-        st.metric("Pass Rate", summary['pass_rate'])
+    if not has_comparison:
+        # No PMS comparison data
+        st.warning("⚠️ **No PMS comparison data provided** - Showing calculated values only. Upload a PMS values file to compare against expected values.")
+    elif recon.is_fully_reconciled:
+        st.success(f"✅ **PASS** - All {summary['total_checks']} reconciliation checks passed")
+    else:
+        st.error(f"❌ **FAIL** - {summary['failed']} of {summary['total_checks']} check(s) failed")
+
+    # Summary metrics - show different view based on comparison availability
+    if has_comparison:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Checks", summary['total_checks'])
+        with col2:
+            st.metric("Passed", summary['passed'], delta=None)
+        with col3:
+            st.metric("Failed", summary['failed'], delta=None, delta_color="inverse")
+        with col4:
+            st.metric("Pass Rate", summary['pass_rate'])
+    else:
+        # Show calculated metrics summary when no comparison
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total P&L", f"${float(pnl.total_pnl):,.2f}")
+        with col2:
+            st.metric("Realized P&L", f"${float(pnl.total_realized_pnl):,.2f}")
+        with col3:
+            st.metric("Unrealized P&L", f"${float(pnl.total_unrealized_pnl):,.2f}")
+        with col4:
+            st.metric("Positions", len(pnl.positions))
 
     st.divider()
 
     # Tabs for different views
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📊 Performance",
         "💰 P&L Summary",
         "📈 Positions",
         "📦 FIFO Lots",
@@ -352,19 +370,92 @@ def display_results(result):
     ])
 
     with tab1:
-        display_pnl_summary(pnl, result['cash_flow_summary'])
+        display_performance_metrics(recon, pnl, has_comparison)
 
     with tab2:
-        display_positions(pnl)
+        display_pnl_summary(pnl, result['cash_flow_summary'])
 
     with tab3:
-        display_lots(result['lot_details'])
+        display_positions(pnl)
 
     with tab4:
-        display_cash_flows(result['transactions'], result['cash_flow_summary'])
+        display_lots(result['lot_details'])
 
     with tab5:
+        display_cash_flows(result['transactions'], result['cash_flow_summary'])
+
+    with tab6:
         generate_download(result)
+
+
+def display_performance_metrics(recon, pnl, has_comparison):
+    """Display performance metrics (XIRR, TWR, P&L)."""
+
+    st.subheader("Calculated Performance Metrics")
+
+    metrics = recon.calculated_metrics
+
+    # Performance returns
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**Investment Returns**")
+        xirr_val = f"{float(metrics.xirr) * 100:.2f}%" if metrics.xirr else "N/A"
+        twr_val = f"{float(metrics.twr) * 100:.2f}%" if metrics.twr else "N/A"
+        twr_ann = f"{float(metrics.twr_annualized) * 100:.2f}%" if metrics.twr_annualized else "N/A"
+
+        returns_df = pd.DataFrame({
+            'Metric': ['XIRR (Money-Weighted)', 'TWR (Time-Weighted)', 'TWR Annualized'],
+            'Value': [xirr_val, twr_val, twr_ann]
+        })
+        st.dataframe(returns_df, use_container_width=True, hide_index=True)
+
+    with col2:
+        st.markdown("**P&L Summary**")
+        pnl_df = pd.DataFrame({
+            'Metric': ['Realized P&L', 'Unrealized P&L', 'Total P&L'],
+            'Value': [
+                f"${float(metrics.realized_pnl):,.2f}",
+                f"${float(metrics.unrealized_pnl):,.2f}",
+                f"${float(metrics.total_pnl):,.2f}",
+            ]
+        })
+        st.dataframe(pnl_df, use_container_width=True, hide_index=True)
+
+    with col3:
+        st.markdown("**Income**")
+        income_df = pd.DataFrame({
+            'Metric': ['Dividend Income', 'Interest Income', 'Total Income'],
+            'Value': [
+                f"${float(metrics.dividend_income):,.2f}",
+                f"${float(metrics.interest_income):,.2f}",
+                f"${float(metrics.total_income):,.2f}",
+            ]
+        })
+        st.dataframe(income_df, use_container_width=True, hide_index=True)
+
+    # Show comparison results if available
+    if has_comparison:
+        st.divider()
+        st.subheader("Reconciliation Details")
+
+        recon_data = []
+        for r in recon.results:
+            recon_data.append({
+                'Metric': r.metric_name,
+                'Symbol': r.symbol or 'Portfolio',
+                'Calculated': float(r.calculated_value),
+                'Expected': float(r.expected_value),
+                'Difference': float(r.difference),
+                'Tolerance': float(r.tolerance),
+                'Status': '✅ PASS' if r.is_pass else '❌ FAIL',
+            })
+
+        if recon_data:
+            df = pd.DataFrame(recon_data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No reconciliation checks to display")
 
 
 def display_pnl_summary(pnl, cash_summary):
