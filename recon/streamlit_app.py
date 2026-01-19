@@ -100,6 +100,14 @@ def main():
 
         # Settings
         st.header("⚙️ Settings")
+
+        # Mode selection
+        calc_mode = st.radio(
+            "Mode",
+            ["Calculate Only", "Compare to PMS"],
+            help="Calculate Only: Compute metrics independently. Compare to PMS: Upload expected values to reconcile."
+        )
+
         portfolio_id = st.text_input("Portfolio ID", value="default")
         base_currency = st.selectbox("Base Currency", ["USD", "EUR", "GBP", "CHF", "JPY"], index=0)
         valuation_date = st.date_input("Valuation Date", value=date.today())
@@ -107,7 +115,8 @@ def main():
         st.divider()
 
         # Run button
-        run_button = st.button("🚀 Run Reconciliation", type="primary", use_container_width=True)
+        button_label = "🧮 Calculate Performance" if calc_mode == "Calculate Only" else "🚀 Run Reconciliation"
+        run_button = st.button(button_label, type="primary", use_container_width=True)
 
     # Main content area
     if transactions_file is None:
@@ -165,11 +174,12 @@ def main():
 
     elif run_button:
         # Run reconciliation
-        with st.spinner("Running reconciliation..."):
+        spinner_text = "Calculating performance metrics..." if calc_mode == "Calculate Only" else "Running reconciliation..."
+        with st.spinner(spinner_text):
             try:
                 result = run_reconciliation(
                     transactions_file,
-                    pms_file,
+                    pms_file if calc_mode == "Compare to PMS" else None,  # Ignore PMS file in Calculate Only mode
                     prices_file,
                     portfolio_id,
                     base_currency,
@@ -177,6 +187,7 @@ def main():
                 )
 
                 if result:
+                    result['calc_mode'] = calc_mode
                     display_results(result)
 
             except Exception as e:
@@ -319,23 +330,38 @@ def display_results(result):
     recon = result['reconciliation']
     pnl = result['portfolio_pnl']
     summary = recon.get_summary()
-
-    # Overall status
-    st.header("📊 Reconciliation Results")
+    calc_mode = result.get('calc_mode', 'Calculate Only')
 
     # Check if we have comparison data
     has_comparison = summary['total_checks'] > 0
 
-    if not has_comparison:
-        # No PMS comparison data
-        st.warning("⚠️ **No PMS comparison data provided** - Showing calculated values only. Upload a PMS values file to compare against expected values.")
-    elif recon.is_fully_reconciled:
-        st.success(f"✅ **PASS** - All {summary['total_checks']} reconciliation checks passed")
+    # Overall status based on mode
+    if calc_mode == "Calculate Only":
+        st.header("📊 Performance Calculation Results")
+        st.success("✅ **Calculation Complete** - Use these values to compare against your PMS data")
     else:
-        st.error(f"❌ **FAIL** - {summary['failed']} of {summary['total_checks']} check(s) failed")
+        st.header("📊 Reconciliation Results")
+        if not has_comparison:
+            st.warning("⚠️ **No PMS comparison data provided** - Upload a PMS values file to compare.")
+        elif recon.is_fully_reconciled:
+            st.success(f"✅ **PASS** - All {summary['total_checks']} reconciliation checks passed")
+        else:
+            st.error(f"❌ **FAIL** - {summary['failed']} of {summary['total_checks']} check(s) failed")
 
-    # Summary metrics - show different view based on comparison availability
-    if has_comparison:
+    # Summary metrics - show calculated values prominently
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total P&L", f"${float(pnl.total_pnl):,.2f}")
+    with col2:
+        st.metric("Realized P&L", f"${float(pnl.total_realized_pnl):,.2f}")
+    with col3:
+        st.metric("Unrealized P&L", f"${float(pnl.total_unrealized_pnl):,.2f}")
+    with col4:
+        st.metric("Positions", len(pnl.positions))
+
+    # Show reconciliation summary if in comparison mode with data
+    if has_comparison and calc_mode == "Compare to PMS":
+        st.divider()
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Checks", summary['total_checks'])
@@ -345,17 +371,6 @@ def display_results(result):
             st.metric("Failed", summary['failed'], delta=None, delta_color="inverse")
         with col4:
             st.metric("Pass Rate", summary['pass_rate'])
-    else:
-        # Show calculated metrics summary when no comparison
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total P&L", f"${float(pnl.total_pnl):,.2f}")
-        with col2:
-            st.metric("Realized P&L", f"${float(pnl.total_realized_pnl):,.2f}")
-        with col3:
-            st.metric("Unrealized P&L", f"${float(pnl.total_unrealized_pnl):,.2f}")
-        with col4:
-            st.metric("Positions", len(pnl.positions))
 
     st.divider()
 
@@ -370,7 +385,7 @@ def display_results(result):
     ])
 
     with tab1:
-        display_performance_metrics(recon, pnl, has_comparison)
+        display_performance_metrics(recon, pnl, has_comparison, calc_mode)
 
     with tab2:
         display_pnl_summary(pnl, result['cash_flow_summary'])
@@ -388,10 +403,14 @@ def display_results(result):
         generate_download(result)
 
 
-def display_performance_metrics(recon, pnl, has_comparison):
+def display_performance_metrics(recon, pnl, has_comparison, calc_mode="Calculate Only"):
     """Display performance metrics (XIRR, TWR, P&L)."""
 
-    st.subheader("Calculated Performance Metrics")
+    if calc_mode == "Calculate Only":
+        st.subheader("📋 Independent Calculation Results")
+        st.info("Compare these calculated values against your PMS to identify discrepancies")
+    else:
+        st.subheader("Calculated Performance Metrics")
 
     metrics = recon.calculated_metrics
 
