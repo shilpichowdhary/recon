@@ -519,7 +519,7 @@ def display_results(result):
     ])
 
     with tab1:
-        display_performance_metrics(recon, pnl, has_comparison, calc_mode)
+        display_performance_metrics(recon, pnl, has_pms_data, calc_mode)
 
     with tab2:
         display_pnl_summary(pnl, result['cash_flow_summary'])
@@ -537,7 +537,7 @@ def display_results(result):
         generate_download(result)
 
 
-def display_performance_metrics(recon, pnl, has_comparison, calc_mode="Calculate Only"):
+def display_performance_metrics(recon, pnl, has_pms_data, calc_mode="Calculate Only"):
     """Display performance metrics (XIRR, TWR, P&L)."""
 
     if calc_mode == "Calculate Only":
@@ -588,7 +588,7 @@ def display_performance_metrics(recon, pnl, has_comparison, calc_mode="Calculate
         st.dataframe(income_df, use_container_width=True, hide_index=True)
 
     # Show comparison results if available
-    if has_comparison:
+    if has_pms_data:
         st.divider()
         st.subheader("Reconciliation Details")
 
