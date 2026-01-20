@@ -128,7 +128,14 @@ class LotTrackingService:
         }
 
     def _process_stock_split(self, txn: Transaction) -> Dict:
-        """Process stock split - adjust lot quantities."""
+        """Process stock split - adjust lot quantities.
+
+        The split quantity (txn.quantity) represents the NEW shares received
+        from the split, not a multiplier. For example, in a 10:1 split on 1 share:
+        - You have 1 share before
+        - You receive 9 additional shares (txn.quantity = 9)
+        - You have 10 shares after
+        """
         queue = self._queues.get(txn.symbol)
 
         if not queue:
@@ -137,29 +144,49 @@ class LotTrackingService:
                 "error": f"No lots found for {txn.symbol}",
             }
 
-        # txn.quantity should be the split ratio (e.g., 2.0 for 2:1 split)
-        split_ratio = txn.quantity
+        # txn.quantity is the number of NEW shares received from the split
+        additional_shares = txn.quantity
+        total_existing_shares = queue.total_quantity
 
+        # Calculate the effective split ratio for price adjustment
+        # If you had 10 shares and received 90 more, ratio is (10+90)/10 = 10
+        if total_existing_shares > 0:
+            effective_ratio = (total_existing_shares + additional_shares) / total_existing_shares
+        else:
+            # No existing shares - this shouldn't happen for a split
+            return {
+                "action": "split_error",
+                "error": f"No existing shares to split for {txn.symbol}",
+            }
+
+        # Distribute additional shares proportionally across lots
         for lot in queue._lots:
             old_qty = lot.remaining_quantity
             old_price = lot.acquisition_price
 
-            # Adjust quantity and price inversely
-            lot.remaining_quantity = old_qty * split_ratio
-            lot.acquisition_quantity = lot.acquisition_quantity * split_ratio
-            lot.acquisition_price = old_price / split_ratio
+            # Each lot gets proportional additional shares
+            lot_additional = additional_shares * (old_qty / total_existing_shares)
+
+            # Adjust quantity: add the additional shares
+            lot.remaining_quantity = old_qty + lot_additional
+            lot.acquisition_quantity = lot.acquisition_quantity * effective_ratio
+
+            # Adjust price: divide by the effective ratio to maintain cost basis
+            lot.acquisition_price = old_price / effective_ratio
 
         self._corporate_actions.append({
             "type": "stock_split",
             "symbol": txn.symbol,
             "date": txn.transaction_date.isoformat(),
-            "ratio": float(split_ratio),
+            "additional_shares": float(additional_shares),
+            "effective_ratio": float(effective_ratio),
         })
 
         return {
             "action": "split_processed",
             "symbol": txn.symbol,
-            "split_ratio": float(split_ratio),
+            "additional_shares": float(additional_shares),
+            "effective_ratio": float(effective_ratio),
             "lots_adjusted": len(queue.lots),
         }
 

@@ -40,6 +40,9 @@ class TransactionType(Enum):
     TRANSFER_IN = auto()
     TRANSFER_OUT = auto()
 
+    # FX
+    FX_TRADE = auto()
+
     @classmethod
     def is_buy(cls, txn_type: "TransactionType") -> bool:
         """Check if transaction type is a buy-side transaction."""

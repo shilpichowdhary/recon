@@ -257,11 +257,16 @@ class ReconciliationService:
         portfolio_pnl: PortfolioPnL,
         valuation_date: date,
     ) -> List[CashFlow]:
-        """Build cash flow list for IRR calculation."""
+        """Build cash flow list for portfolio-level XIRR calculation.
+
+        Uses external cash flows only (deposits/withdrawals), not internal
+        transactions (buys/sells) which are just rebalancing within the portfolio.
+        """
         cash_flows = []
 
         for txn in transactions:
-            cf_amount = txn.to_cash_flow()
+            # Use external cash flow method for portfolio-level XIRR
+            cf_amount = txn.to_external_cash_flow()
             if cf_amount != Decimal("0"):
                 cash_flows.append(CashFlow(
                     date=txn.transaction_date,
@@ -269,6 +274,7 @@ class ReconciliationService:
                 ))
 
         # Add terminal value (current portfolio value)
+        # This represents what you'd get if you liquidated the portfolio
         if portfolio_pnl.total_market_value > 0:
             cash_flows.append(CashFlow(
                 date=valuation_date,

@@ -169,9 +169,11 @@ def main():
         spinner_text = "Calculating performance metrics..." if calc_mode == "Calculate Only" else "Running reconciliation..."
         with st.spinner(spinner_text):
             try:
+                # Always pass positions file for prices and FX rates
+                # Mode only affects whether we compare to PMS values
                 result = run_reconciliation(
                     transactions_file,
-                    positions_file if calc_mode == "Compare to PMS" else None,
+                    positions_file,  # Always use if provided (for prices & FX rates)
                     portfolio_id,
                     base_currency,
                     valuation_date
@@ -217,7 +219,7 @@ def main():
 
 
 def load_positions_file(positions_file):
-    """Load positions file and extract PMS values and current prices."""
+    """Load positions file and extract PMS values, current prices, and FX rates."""
     if positions_file.name.endswith('.csv'):
         df = pd.read_csv(positions_file)
     else:
@@ -227,6 +229,7 @@ def load_positions_file(positions_file):
     df.columns = [str(c).lower().strip() for c in df.columns]
 
     current_prices = {}
+    fx_rates = {}  # Symbol -> FX rate to convert local to base currency
     pms_positions = {}
     pms_totals = {
         'total_market_value': Decimal('0'),
@@ -249,17 +252,25 @@ def load_positions_file(positions_file):
         if not symbol:
             continue
 
-        # Get market price
+        # Get market price and FX rate
         market_price = row.get('market price', 0)
+        fx_rate = row.get('fx rate', 1) or 1  # FX rate to convert local to base
+
         if market_price and pd.notna(market_price):
             try:
                 current_prices[symbol] = Decimal(str(market_price))
+                fx_rates[symbol] = Decimal(str(fx_rate))
             except:
                 pass
 
         # Get PMS values for this position
+        # Use historic FX cost basis for proper comparison (matches our FIFO calculation)
         quantity = Decimal(str(row.get('quantity', 0) or 0))
-        cost_value = Decimal(str(row.get('cost value (base, eod fx)') or row.get('cost value (local)') or 0))
+        cost_value = Decimal(str(
+            row.get('cost value (base, historic fx)') or  # Preferred: historic FX rate
+            row.get('cost value (base, eod fx)') or       # Fallback: EOD FX rate
+            row.get('cost value (local)') or 0
+        ))
         market_value = Decimal(str(row.get('total market value (base)') or row.get('total market value (local)') or 0))
         unrealized_pnl = Decimal(str(row.get('total unrealised gain / loss (base)') or row.get('unrealised gain / loss (local)') or 0))
         realized_pnl = Decimal(str(row.get('total realised gain / loss (base)') or row.get('realised gain / loss (local)') or 0))
@@ -286,7 +297,7 @@ def load_positions_file(positions_file):
         pms_totals['total_income'] += income
         pms_totals['total_pnl'] += total_pnl
 
-    return current_prices, pms_positions, pms_totals
+    return current_prices, fx_rates, pms_positions, pms_totals
 
 
 def run_reconciliation(transactions_file, positions_file, portfolio_id, base_currency, valuation_date):
@@ -317,19 +328,21 @@ def run_reconciliation(transactions_file, positions_file, portfolio_id, base_cur
                     if issue.severity.value == "WARNING":
                         st.warning(f"{issue.field}: {issue.message}")
 
-        # Load positions file (contains current prices AND PMS values)
+        # Load positions file (contains current prices, FX rates, AND PMS values)
         current_prices = {}
+        fx_rates = {}
         pms_positions = {}
         pms_totals = {}
 
         if positions_file:
-            current_prices, pms_positions, pms_totals = load_positions_file(positions_file)
-            st.success(f"✅ Loaded {len(pms_positions)} positions with market prices")
+            current_prices, fx_rates, pms_positions, pms_totals = load_positions_file(positions_file)
+            st.success(f"✅ Loaded {len(pms_positions)} positions with market prices and FX rates")
 
         # Fallback: use last transaction price for missing symbols
         for txn in sorted(transactions, key=lambda t: t.transaction_date):
             if txn.symbol not in current_prices and txn.price and txn.price > 0:
                 current_prices[txn.symbol] = txn.price
+                fx_rates[txn.symbol] = Decimal('1')  # Default FX rate
 
         # Build expected values from PMS totals for reconciliation
         expected_values = {
@@ -348,15 +361,17 @@ def run_reconciliation(transactions_file, positions_file, portfolio_id, base_cur
             portfolio_id=portfolio_id,
             valuation_date=valuation_date,
             base_currency=base_currency,
+            fx_rates=fx_rates,
         )
 
         recon_service = ReconciliationService()
         recon_result = recon_service.run_reconciliation(recon_input)
 
-        # Calculate P&L for display
+        # Calculate P&L for display with FX rates
         pnl_calculator = PnLCalculator()
         pnl_calculator.process_transactions(transactions)
-        portfolio_pnl = pnl_calculator.calculate_unrealized_pnl(current_prices)
+        portfolio_pnl = pnl_calculator.calculate_unrealized_pnl(current_prices, fx_rates)
+
 
         # Get additional data
         lot_details = recon_service.get_lot_details()
@@ -467,16 +482,36 @@ def display_results(result):
             'Status': '✅' if abs(diff_tpnl) < 1 else '❌'
         })
 
-        # Income
-        calc_inc = float(pnl.dividend_income + pnl.interest_income)
+        # Net Income (dividends + interest + option premium - expenses)
+        calc_inc = float(pnl.net_realized_income)
         pms_inc = float(pms_totals.get('total_income', 0))
         diff_inc = calc_inc - pms_inc
         comparison_data.append({
-            'Metric': 'Total Income',
+            'Metric': 'Net Realized Income',
             'Calculated': f"${calc_inc:,.2f}",
             'PMS': f"${pms_inc:,.2f}",
             'Difference': f"${diff_inc:,.2f}",
             'Status': '✅' if abs(diff_inc) < 1 else '❌'
+        })
+
+        # Capital Gains (from FIFO disposals)
+        calc_cg = float(pnl.realized_capital_gains)
+        comparison_data.append({
+            'Metric': 'Realized Capital Gains',
+            'Calculated': f"${calc_cg:,.2f}",
+            'PMS': 'N/A',
+            'Difference': '-',
+            'Status': 'ℹ️'
+        })
+
+        # Option Premium Received
+        calc_premium = float(pnl.option_premium_received)
+        comparison_data.append({
+            'Metric': 'Option Premium Received',
+            'Calculated': f"${calc_premium:,.2f}",
+            'PMS': 'N/A',
+            'Difference': '-',
+            'Status': 'ℹ️'
         })
 
         df_comparison = pd.DataFrame(comparison_data)
@@ -566,8 +601,10 @@ def display_performance_metrics(recon, pnl, has_pms_data, calc_mode="Calculate O
     with col2:
         st.markdown("**P&L Summary**")
         pnl_df = pd.DataFrame({
-            'Metric': ['Realized P&L', 'Unrealized P&L', 'Total P&L'],
+            'Metric': ['Capital Gains', 'Net Income', 'Total Realized P&L', 'Unrealized P&L', 'Total P&L'],
             'Value': [
+                f"${float(pnl.realized_capital_gains):,.2f}",
+                f"${float(pnl.net_realized_income):,.2f}",
                 f"${float(metrics.realized_pnl):,.2f}",
                 f"${float(metrics.unrealized_pnl):,.2f}",
                 f"${float(metrics.total_pnl):,.2f}",
@@ -576,13 +613,15 @@ def display_performance_metrics(recon, pnl, has_pms_data, calc_mode="Calculate O
         st.dataframe(pnl_df, use_container_width=True, hide_index=True)
 
     with col3:
-        st.markdown("**Income**")
+        st.markdown("**Income Breakdown**")
         income_df = pd.DataFrame({
-            'Metric': ['Dividend Income', 'Interest Income', 'Total Income'],
+            'Metric': ['Dividend Income', 'Interest Income', 'Option Premium', 'Less: Fees/Taxes', 'Net Income'],
             'Value': [
-                f"${float(metrics.dividend_income):,.2f}",
-                f"${float(metrics.interest_income):,.2f}",
-                f"${float(metrics.total_income):,.2f}",
+                f"${float(pnl.gross_dividend_income):,.2f}",
+                f"${float(pnl.gross_interest_income):,.2f}",
+                f"${float(pnl.option_premium_received):,.2f}",
+                f"-${float(pnl.withholding_tax + pnl.interest_expense + pnl.other_fees):,.2f}",
+                f"${float(pnl.net_realized_income):,.2f}",
             ]
         })
         st.dataframe(income_df, use_container_width=True, hide_index=True)
@@ -612,34 +651,67 @@ def display_performance_metrics(recon, pnl, has_pms_data, calc_mode="Calculate O
 
 
 def display_pnl_summary(pnl, cash_summary):
-    """Display P&L summary."""
+    """Display P&L summary with separated capital gains and income."""
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.subheader("P&L Breakdown")
+        st.subheader("💹 Capital Gains")
+        st.markdown("*From FIFO lot disposals*")
 
-        metrics_df = pd.DataFrame({
-            'Metric': ['Realized P&L', 'Unrealized P&L', 'Total P&L', 'Dividend Income', 'Interest Income'],
+        capital_df = pd.DataFrame({
+            'Metric': ['Realized Capital Gains', 'Unrealized P&L', 'Total Capital P&L'],
             'Value': [
-                f"${float(pnl.total_realized_pnl):,.2f}",
+                f"${float(pnl.realized_capital_gains):,.2f}",
                 f"${float(pnl.total_unrealized_pnl):,.2f}",
-                f"${float(pnl.total_pnl):,.2f}",
-                f"${float(pnl.dividend_income):,.2f}",
-                f"${float(pnl.interest_income):,.2f}",
+                f"${float(pnl.realized_capital_gains + pnl.total_unrealized_pnl):,.2f}",
             ]
         })
-        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+        st.dataframe(capital_df, use_container_width=True, hide_index=True)
 
     with col2:
-        st.subheader("Portfolio Summary")
+        st.subheader("💰 Income Breakdown")
+        st.markdown("*Dividends, interest, premiums*")
+
+        income_df = pd.DataFrame({
+            'Category': [
+                'Gross Dividend Income',
+                'Gross Interest Income',
+                'Option Premium Received',
+                'Withholding Tax',
+                'Interest Expense',
+                'Other Fees',
+                '**Net Realized Income**'
+            ],
+            'Amount': [
+                f"${float(pnl.gross_dividend_income):,.2f}",
+                f"${float(pnl.gross_interest_income):,.2f}",
+                f"${float(pnl.option_premium_received):,.2f}",
+                f"-${float(pnl.withholding_tax):,.2f}",
+                f"-${float(pnl.interest_expense):,.2f}",
+                f"-${float(pnl.other_fees):,.2f}",
+                f"**${float(pnl.net_realized_income):,.2f}**"
+            ]
+        })
+        st.dataframe(income_df, use_container_width=True, hide_index=True)
+
+    with col3:
+        st.subheader("📊 Portfolio Summary")
 
         summary_df = pd.DataFrame({
-            'Metric': ['Total Cost Basis', 'Total Market Value', 'Total Positions'],
+            'Metric': [
+                'Total Cost Basis',
+                'Total Market Value',
+                'Total Realized P&L',
+                'Total P&L',
+                'Total Positions'
+            ],
             'Value': [
                 f"${float(pnl.total_cost_basis):,.2f}",
                 f"${float(pnl.total_market_value):,.2f}",
-                len(pnl.positions)
+                f"${float(pnl.total_realized_pnl):,.2f}",
+                f"${float(pnl.total_pnl):,.2f}",
+                str(len(pnl.positions))
             ]
         })
         st.dataframe(summary_df, use_container_width=True, hide_index=True)

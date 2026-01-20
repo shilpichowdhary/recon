@@ -82,15 +82,26 @@ class Lot:
         """
         Dispose of units from this lot using FIFO.
 
+        Args:
+            quantity: Number of units to dispose
+            sale_price: Sale price per unit in local currency
+            sale_date: Date of sale
+            sale_fx_rate: FX rate to convert sale proceeds to base currency
+
         Returns:
-            Tuple of (quantity_disposed, realized_pnl)
+            Tuple of (quantity_disposed, realized_pnl in base currency)
+
+        Note: Cost basis (cost_per_unit) is already stored in base currency,
+              so no FX conversion is needed on the cost side.
         """
         if quantity > self.remaining_quantity:
             quantity = self.remaining_quantity
 
-        # Calculate realized P&L
+        # Sale proceeds: local price converted to base currency
         sale_proceeds = quantity * sale_price * sale_fx_rate
-        cost_basis = self.cost_per_unit * quantity * self.acquisition_fx_rate
+
+        # Cost basis is already in base currency (from transaction loading)
+        cost_basis = self.cost_per_unit * quantity
         realized_pnl = sale_proceeds - cost_basis
 
         # Reduce remaining quantity
@@ -100,12 +111,26 @@ class Lot:
 
     def calculate_unrealized_pnl(self, current_price: Decimal,
                                    current_fx_rate: Decimal = Decimal("1")) -> Decimal:
-        """Calculate unrealized P&L for remaining units."""
+        """Calculate unrealized P&L for remaining units.
+
+        Args:
+            current_price: Current market price in local currency
+            current_fx_rate: FX rate to convert local to base currency
+
+        Returns:
+            Unrealized P&L in base currency
+
+        Note: Cost basis (remaining_cost_basis) is already stored in base currency,
+              so no FX conversion is needed on the cost side.
+        """
         if self.remaining_quantity <= Decimal("0"):
             return Decimal("0")
 
+        # Market value: local price converted to base currency
         current_value = self.remaining_quantity * current_price * current_fx_rate
-        cost_basis = self.remaining_cost_basis * self.acquisition_fx_rate
+
+        # Cost basis is already in base currency (from transaction loading)
+        cost_basis = self.remaining_cost_basis
 
         return current_value - cost_basis
 

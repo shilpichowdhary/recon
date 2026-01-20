@@ -110,6 +110,7 @@ class DataValidator:
         "option_expiry": TransactionType.OPTION_EXPIRY,
         "transfer_in": TransactionType.TRANSFER_IN,
         "transfer_out": TransactionType.TRANSFER_OUT,
+        "fx_trade": TransactionType.FX_TRADE,
     }
 
     # Valid asset type mappings

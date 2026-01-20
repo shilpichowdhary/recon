@@ -61,6 +61,11 @@ class ExcelLoader:
         "trade gross value": "gross_amount",
         "trade net value": "net_amount",
         "trade_net_value": "net_amount",
+        # Base currency values (preferred for cost basis)
+        "trade value (base)": "trade_value_(base)",
+        "net value (base)": "net_value_(base)",
+        "cost value (base)": "cost_value_(base)",
+        "income (base)": "income_(base)",
         # FX
         "local fx rate": "fx_rate",
         "local_fx_rate": "fx_rate",
@@ -105,7 +110,7 @@ class ExcelLoader:
         # Additional PMS transaction types
         "intrecd": "interest",  # Interest Received
         "intpaid": "fee",  # Interest Paid (expense)
-        "subs": "buy",  # Subscription/Purchase
+        "subs": "deposit",  # Subscription/Cash deposit
         "red": "sell",  # Redemption
         "redem": "sell",  # Redemption
         "purchase": "buy",
@@ -131,6 +136,14 @@ class ExcelLoader:
         "corpact": "transfer_in",  # Corporate action
         "ati": "transfer_in",  # Accrued Transfer In / Initial position transfer
         "rtax": "fee",  # Reclaim Tax / Tax Refund
+        "wdraw": "withdrawal",  # Withdrawal
+        "othin": "transfer_in",  # Other income in
+        "chgs": "fee",  # Charges
+        # Options specific
+        "btc": "buy",  # Buy to Close (closing short option position)
+        "sto": "sell",  # Sell to Open (opening short option position)
+        # FX
+        "fxspot": "fx_trade",  # FX spot transaction
     }
 
     def __init__(self, validator: Optional[DataValidator] = None):
@@ -372,25 +385,38 @@ class ExcelLoader:
         currency = CurrencyCode.from_string(str(row["currency"]))
 
         # Parse numeric fields
-        quantity = self._parse_decimal(row.get("quantity", 0))
+        # Note: Some PMS systems store sell quantities as negative - take absolute value
+        quantity = abs(self._parse_decimal(row.get("quantity", 0)))
         price = self._parse_decimal(row.get("price", 0))
         commission = self._parse_decimal(row.get("commission", 0))
         fees = self._parse_decimal(row.get("fees", 0))
         taxes = self._parse_decimal(row.get("taxes", 0))
-        fx_rate = self._parse_decimal(row.get("fx_rate", 1))
 
-        # Get gross_amount from file (important for dividends/income where qty=0)
-        # Try multiple column names that might contain the amount
+        # Get FX rate - prefer base_fx_rate for converting to base currency
+        fx_rate = self._parse_decimal(
+            row.get("base_fx_rate") or
+            row.get("fx_rate") or
+            1
+        )
+
+        # Get gross_amount - prefer base currency values
         gross_amount = self._parse_decimal(
+            row.get("trade_value_(base)") or  # Base currency value
             row.get("gross_amount") or
             row.get("trade_amount") or
+            row.get("income_(base)") or  # For income transactions
             row.get("income") or
             row.get("trade_income") or
             0
         )
 
-        # Get net_amount from file
-        net_amount = self._parse_decimal(row.get("net_amount", 0))
+        # Get net_amount - prefer base currency values
+        net_amount = self._parse_decimal(
+            row.get("net_value_(base)") or  # Base currency value
+            row.get("trade_net_value") or
+            row.get("net_amount") or
+            0
+        )
 
         # Build transaction
         transaction = Transaction(

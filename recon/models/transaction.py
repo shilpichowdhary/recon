@@ -110,13 +110,30 @@ class Transaction:
         }
 
     def to_cash_flow(self) -> Decimal:
-        """Convert transaction to cash flow value (negative for outflows)."""
+        """Convert transaction to cash flow for SECURITY-level IRR (includes buys/sells)."""
         if self.transaction_type in {TransactionType.DEPOSIT, TransactionType.BUY, TransactionType.OPTION_BUY}:
             return -self.net_amount
         elif self.transaction_type in {TransactionType.WITHDRAWAL, TransactionType.SELL, TransactionType.OPTION_SELL}:
             return self.net_amount
         elif TransactionType.is_income(self.transaction_type):
             return self.net_amount
+        else:
+            return Decimal("0")
+
+    def to_external_cash_flow(self) -> Decimal:
+        """Convert transaction to cash flow for PORTFOLIO-level IRR (external flows only).
+
+        For portfolio XIRR, only external cash flows matter:
+        - Deposits = money coming INTO portfolio (negative = investment)
+        - Withdrawals = money going OUT of portfolio (positive = distribution)
+
+        Buys/sells are internal rebalancing and don't affect portfolio-level returns.
+        Dividends/interest that stay in portfolio are part of the ending value.
+        """
+        if self.transaction_type == TransactionType.DEPOSIT:
+            return -self.net_amount  # Money in = negative
+        elif self.transaction_type == TransactionType.WITHDRAWAL:
+            return self.net_amount   # Money out = positive
         else:
             return Decimal("0")
 

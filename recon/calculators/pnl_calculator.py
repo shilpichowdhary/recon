@@ -34,30 +34,65 @@ class PositionPnL:
 class PortfolioPnL:
     """Aggregate P&L for entire portfolio."""
     positions: Dict[str, PositionPnL] = field(default_factory=dict)
-    total_realized_pnl: Decimal = Decimal("0")
+
+    # Capital gains from selling securities (FIFO)
+    realized_capital_gains: Decimal = Decimal("0")
+
+    # Income breakdown
+    gross_dividend_income: Decimal = Decimal("0")
+    gross_interest_income: Decimal = Decimal("0")
+    option_premium_received: Decimal = Decimal("0")  # Premium from selling options
+    withholding_tax: Decimal = Decimal("0")
+    interest_expense: Decimal = Decimal("0")
+    other_fees: Decimal = Decimal("0")
+
+    # Computed totals
     total_unrealized_pnl: Decimal = Decimal("0")
-    total_pnl: Decimal = Decimal("0")
     total_cost_basis: Decimal = Decimal("0")
     total_market_value: Decimal = Decimal("0")
-    dividend_income: Decimal = Decimal("0")
-    interest_income: Decimal = Decimal("0")
+
+    @property
+    def net_realized_income(self) -> Decimal:
+        """Net income after taxes and expenses (includes option premium)."""
+        return (
+            self.gross_dividend_income +
+            self.gross_interest_income +
+            self.option_premium_received -
+            self.withholding_tax -
+            self.interest_expense -
+            self.other_fees
+        )
+
+    @property
+    def total_realized_pnl(self) -> Decimal:
+        """Total realized P&L (capital gains + net income)."""
+        return self.realized_capital_gains + self.net_realized_income
+
+    @property
+    def total_pnl(self) -> Decimal:
+        """Total P&L including unrealized."""
+        return self.realized_capital_gains + self.net_realized_income + self.total_unrealized_pnl
+
+    # Legacy compatibility
+    @property
+    def dividend_income(self) -> Decimal:
+        return self.gross_dividend_income
+
+    @property
+    def interest_income(self) -> Decimal:
+        return self.gross_interest_income
 
     def add_position(self, position: PositionPnL) -> None:
         """Add a position and update totals."""
         self.positions[position.symbol] = position
-        self.total_realized_pnl += position.realized_pnl
+        self.realized_capital_gains += position.realized_pnl
         self.total_unrealized_pnl += position.unrealized_pnl
         self.total_cost_basis += position.cost_basis
         self.total_market_value += position.market_value
 
     def finalize(self) -> None:
-        """Calculate final totals."""
-        self.total_pnl = (
-            self.total_realized_pnl +
-            self.total_unrealized_pnl +
-            self.dividend_income +
-            self.interest_income
-        )
+        """Finalize calculations (no-op, totals computed via properties)."""
+        pass
 
 
 class PnLCalculator:
@@ -70,11 +105,26 @@ class PnLCalculator:
     - Dividend and interest income
     """
 
+    # Currency codes that should be treated as cash (not tracked via FIFO lots)
+    CASH_SYMBOLS = {
+        'USD', 'EUR', 'GBP', 'CHF', 'JPY', 'CAD', 'AUD', 'NZD', 'HKD', 'SGD',
+        'CNY', 'CNH', 'INR', 'KRW', 'TWD', 'THB', 'MYR', 'IDR', 'PHP', 'VND',
+        'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'HUF', 'TRY', 'ZAR', 'MXN', 'BRL',
+        'ARS', 'CLP', 'COP', 'PEN', 'ILS', 'AED', 'SAR', 'KWD', 'BHD', 'QAR',
+    }
+
     def __init__(self):
         """Initialize P&L calculator."""
         self._lot_queues: Dict[str, LotQueue] = {}
         self._income: Dict[str, Decimal] = defaultdict(Decimal)
         self._transactions: List[Transaction] = []
+        self._cash_balances: Dict[str, Decimal] = defaultdict(Decimal)  # Track cash separately
+
+    def _is_cash_symbol(self, symbol: str) -> bool:
+        """Check if symbol is a cash/currency position."""
+        if not symbol:
+            return False
+        return symbol.upper() in self.CASH_SYMBOLS
 
     def process_transactions(
         self,
@@ -103,6 +153,19 @@ class PnLCalculator:
     def _process_transaction(self, txn: Transaction) -> None:
         """Process a single transaction."""
         symbol = txn.symbol
+        is_cash = self._is_cash_symbol(symbol)
+
+        # Always process income and fees regardless of whether it's a cash symbol
+        if TransactionType.is_income(txn.transaction_type):
+            self._process_income(txn)
+            return
+        elif txn.transaction_type in {TransactionType.FEE, TransactionType.COMMISSION}:
+            self._process_fee(txn)
+            return
+
+        # Skip cash symbols from lot tracking (buys, sells, splits)
+        if is_cash:
+            return
 
         # Initialize lot queue if needed
         if symbol not in self._lot_queues:
@@ -112,9 +175,22 @@ class PnLCalculator:
         if txn.is_buy:
             self._process_buy(txn)
         elif txn.is_sell:
-            self._process_sell(txn)
-        elif TransactionType.is_income(txn.transaction_type):
-            self._process_income(txn)
+            # Check if this is an option sale (STO) - record premium as income
+            if self._is_option_symbol(symbol) and txn.net_amount and txn.net_amount > 0:
+                self._process_option_premium(txn)
+            else:
+                self._process_sell(txn)
+        elif txn.transaction_type == TransactionType.STOCK_SPLIT:
+            self._process_stock_split(txn)
+
+    def _is_option_symbol(self, symbol: str) -> bool:
+        """Check if symbol is an option."""
+        if not symbol:
+            return False
+        symbol_upper = symbol.upper()
+        # Common option suffixes: _OPQ (options exchange)
+        # Format like QQQO3126C375000_OPQ or SPYX1925C450000_OPQ
+        return '_OPQ' in symbol_upper
 
     def _process_buy(self, txn: Transaction) -> None:
         """Process a buy transaction - create new lot."""
@@ -162,15 +238,83 @@ class PnLCalculator:
     def _process_income(self, txn: Transaction) -> None:
         """Process income transaction (dividend, interest, coupon)."""
         if txn.transaction_type == TransactionType.DIVIDEND:
-            self._income["dividend"] += txn.net_amount
+            self._income["gross_dividend"] += txn.net_amount
         elif txn.transaction_type in {TransactionType.INTEREST, TransactionType.COUPON}:
-            self._income["interest"] += txn.net_amount
+            self._income["gross_interest"] += txn.net_amount
+
+    def _process_fee(self, txn: Transaction) -> None:
+        """Process fee/expense transaction (withholding tax, interest paid, etc.)."""
+        # Use absolute value since fees are often stored as negative
+        amount = abs(txn.net_amount) if txn.net_amount else abs(txn.gross_amount)
+
+        # Categorize by description or symbol pattern
+        symbol_lower = txn.symbol.lower() if txn.symbol else ""
+        desc_lower = (txn.description or "").lower()
+
+        # Check if it's withholding tax (WTAX transaction type or tax-related)
+        if "wtax" in symbol_lower or "tax" in desc_lower or "withhold" in desc_lower:
+            self._income["withholding_tax"] += amount
+        # Check if it's interest expense (INTPAID)
+        elif "intpaid" in symbol_lower or "interest paid" in desc_lower:
+            self._income["interest_expense"] += amount
+        else:
+            # Other fees (custody, management, etc.)
+            self._income["other_fees"] += amount
+
+    def _process_option_premium(self, txn: Transaction) -> None:
+        """Process option premium from selling (writing) options."""
+        # Premium received from selling options
+        if txn.net_amount and txn.net_amount > 0:
+            self._income["option_premium"] += txn.net_amount
+        elif txn.gross_amount and txn.gross_amount > 0:
+            self._income["option_premium"] += txn.gross_amount
+
+    def _process_stock_split(self, txn: Transaction) -> None:
+        """Process stock split - adjust lot quantities.
+
+        The split quantity (txn.quantity) represents the NEW shares received
+        from the split, not a multiplier. For example, in a 10:1 split on 1 share:
+        - You have 1 share before
+        - You receive 9 additional shares (txn.quantity = 9)
+        - You have 10 shares after
+        """
+        queue = self._lot_queues.get(txn.symbol)
+        if not queue or queue.total_quantity == 0:
+            return
+
+        # txn.quantity is the number of NEW shares received from the split
+        additional_shares = txn.quantity
+        total_existing_shares = queue.total_quantity
+
+        # Calculate the effective split ratio for price adjustment
+        effective_ratio = (total_existing_shares + additional_shares) / total_existing_shares
+
+        # Distribute additional shares proportionally across lots
+        for lot in queue._lots:
+            old_qty = lot.remaining_quantity
+            old_price = lot.acquisition_price
+
+            # Each lot gets proportional additional shares
+            lot_additional = additional_shares * (old_qty / total_existing_shares)
+
+            # Adjust quantity: add the additional shares
+            lot.remaining_quantity = old_qty + lot_additional
+            lot.acquisition_quantity = lot.acquisition_quantity * effective_ratio
+
+            # Adjust price: divide by the effective ratio to maintain cost basis
+            lot.acquisition_price = old_price / effective_ratio
 
     def _build_portfolio_pnl(self) -> PortfolioPnL:
         """Build portfolio P&L from lot queues."""
         portfolio = PortfolioPnL()
-        portfolio.dividend_income = self._income.get("dividend", Decimal("0"))
-        portfolio.interest_income = self._income.get("interest", Decimal("0"))
+
+        # Set income breakdown
+        portfolio.gross_dividend_income = self._income.get("gross_dividend", Decimal("0"))
+        portfolio.gross_interest_income = self._income.get("gross_interest", Decimal("0"))
+        portfolio.option_premium_received = self._income.get("option_premium", Decimal("0"))
+        portfolio.withholding_tax = self._income.get("withholding_tax", Decimal("0"))
+        portfolio.interest_expense = self._income.get("interest_expense", Decimal("0"))
+        portfolio.other_fees = self._income.get("other_fees", Decimal("0"))
 
         for symbol, queue in self._lot_queues.items():
             position = PositionPnL(
@@ -194,11 +338,11 @@ class PnLCalculator:
         Calculate unrealized P&L with current prices.
 
         Args:
-            current_prices: Dict of symbol -> current price
-            fx_rates: Optional dict of currency -> USD rate
+            current_prices: Dict of symbol -> current price (in local currency)
+            fx_rates: Optional dict of symbol -> FX rate to convert local to base currency
 
         Returns:
-            Updated PortfolioPnL
+            Updated PortfolioPnL with values in base currency
         """
         portfolio = self._build_portfolio_pnl()
         fx_rates = fx_rates or {}
@@ -207,14 +351,16 @@ class PnLCalculator:
             price = current_prices.get(symbol, Decimal("0"))
             position.current_price = price
 
-            # Get FX rate for this position's currency
-            # Assume USD if not specified
-            fx_rate = Decimal("1")
+            # Get FX rate for this symbol
+            # FX rate converts local currency to base currency (e.g., HKD/USD = 0.128)
+            fx_rate = fx_rates.get(symbol, Decimal("1"))
 
             queue = self._lot_queues.get(symbol)
             if queue:
+                # Calculate unrealized P&L in base currency
                 position.unrealized_pnl = queue.calculate_unrealized_pnl(price, fx_rate)
-                position.market_value = position.quantity * price
+                # Market value in base currency = qty * local_price * fx_rate
+                position.market_value = position.quantity * price * fx_rate
                 position.total_pnl = position.realized_pnl + position.unrealized_pnl
 
         # Recalculate totals
