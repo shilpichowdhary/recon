@@ -253,7 +253,14 @@ def load_positions_file(positions_file):
             continue
 
         # Get market price and FX rate
-        market_price = row.get('market price', 0)
+        # Try multiple possible column names for price
+        market_price = (
+            row.get('price (local)') or  # Most common in PMS exports
+            row.get('market price') or
+            row.get('price') or
+            row.get('current price') or
+            0
+        )
         fx_rate = row.get('fx rate', 1) or 1  # FX rate to convert local to base
 
         if market_price and pd.notna(market_price):
@@ -516,6 +523,122 @@ def display_results(result):
 
         df_comparison = pd.DataFrame(comparison_data)
         st.dataframe(df_comparison, use_container_width=True, hide_index=True)
+
+        # Position-level discrepancy analysis
+        with st.expander("🔍 Position-Level Discrepancy Analysis", expanded=False):
+            st.markdown("**Comparing calculated vs PMS values for each position:**")
+
+            position_comparison = []
+            all_symbols = set(pnl.positions.keys()) | set(pms_positions.keys())
+
+            mv_diff_total = Decimal('0')
+            pnl_diff_total = Decimal('0')
+
+            for symbol in sorted(all_symbols):
+                calc_pos = pnl.positions.get(symbol)
+                pms_pos = pms_positions.get(symbol, {})
+
+                calc_mv = calc_pos.market_value if calc_pos else Decimal('0')
+                pms_mv = pms_pos.get('market_value', Decimal('0'))
+                mv_diff = calc_mv - pms_mv
+                mv_diff_total += mv_diff
+
+                calc_tpnl = calc_pos.total_pnl if calc_pos else Decimal('0')
+                pms_tpnl = pms_pos.get('total_pnl', Decimal('0'))
+                pnl_diff = calc_tpnl - pms_tpnl
+                pnl_diff_total += pnl_diff
+
+                calc_qty = calc_pos.quantity if calc_pos else Decimal('0')
+                pms_qty = pms_pos.get('quantity', Decimal('0'))
+
+                # Flag significant discrepancies
+                has_mv_issue = abs(mv_diff) > 1
+                has_pnl_issue = abs(pnl_diff) > 1
+
+                if has_mv_issue or has_pnl_issue or calc_qty != pms_qty:
+                    position_comparison.append({
+                        'Symbol': symbol,
+                        'Calc Qty': float(calc_qty),
+                        'PMS Qty': float(pms_qty),
+                        'Calc MV': f"${float(calc_mv):,.2f}",
+                        'PMS MV': f"${float(pms_mv):,.2f}",
+                        'MV Diff': f"${float(mv_diff):,.2f}",
+                        'Calc P&L': f"${float(calc_tpnl):,.2f}",
+                        'PMS P&L': f"${float(pms_tpnl):,.2f}",
+                        'P&L Diff': f"${float(pnl_diff):,.2f}",
+                    })
+
+            if position_comparison:
+                st.dataframe(pd.DataFrame(position_comparison), use_container_width=True, hide_index=True)
+                st.markdown(f"**Total MV Difference:** ${float(mv_diff_total):,.2f}")
+                st.markdown(f"**Total P&L Difference:** ${float(pnl_diff_total):,.2f}")
+            else:
+                st.success("All positions match within tolerance!")
+
+            # Show positions in PMS but not in our calculation
+            pms_only = set(pms_positions.keys()) - set(pnl.positions.keys())
+            if pms_only:
+                st.warning(f"**Positions in PMS but not calculated:** {', '.join(sorted(pms_only))}")
+                missing_mv = sum(pms_positions[s].get('market_value', Decimal('0')) for s in pms_only)
+                missing_pnl = sum(pms_positions[s].get('total_pnl', Decimal('0')) for s in pms_only)
+                st.markdown(f"Missing MV: ${float(missing_mv):,.2f}, Missing P&L: ${float(missing_pnl):,.2f}")
+
+            # Show positions we calculated but not in PMS
+            calc_only = set(pnl.positions.keys()) - set(pms_positions.keys())
+            if calc_only:
+                st.info(f"**Positions calculated but not in PMS:** {', '.join(sorted(calc_only))}")
+
+            # P&L calculation breakdown
+            st.markdown("---")
+            st.markdown("**P&L Calculation Breakdown:**")
+
+            pms_realized = float(pms_totals.get('total_realized_pnl', 0))
+            pms_unrealized = float(pms_totals.get('total_unrealized_pnl', 0))
+            pms_income = float(pms_totals.get('total_income', 0))
+            pms_total = float(pms_totals.get('total_pnl', 0))
+
+            # Check how PMS calculates Total P&L
+            pms_check_with_income = pms_realized + pms_unrealized + pms_income
+            pms_check_without_income = pms_realized + pms_unrealized
+
+            st.markdown(f"""
+            | Component | Calculated | PMS |
+            |-----------|-----------|-----|
+            | Realized Capital Gains | ${float(pnl.realized_capital_gains):,.2f} | - |
+            | Gross Dividend Income | ${float(pnl.gross_dividend_income):,.2f} | - |
+            | Gross Interest Income | ${float(pnl.gross_interest_income):,.2f} | - |
+            | Option Premium | ${float(pnl.option_premium_received):,.2f} | - |
+            | Less: Withholding Tax | -${float(pnl.withholding_tax):,.2f} | - |
+            | Less: Interest Expense | -${float(pnl.interest_expense):,.2f} | - |
+            | Less: Other Fees | -${float(pnl.other_fees):,.2f} | - |
+            | **Net Realized Income** | **${float(pnl.net_realized_income):,.2f}** | ${pms_income:,.2f} |
+            | **Total Realized P&L** | **${float(pnl.total_realized_pnl):,.2f}** | ${pms_realized:,.2f} |
+            | Unrealized P&L | ${float(pnl.total_unrealized_pnl):,.2f} | ${pms_unrealized:,.2f} |
+            | **TOTAL P&L** | **${float(pnl.total_pnl):,.2f}** | **${pms_total:,.2f}** |
+            """)
+
+            # Diagnostic: How does PMS calculate Total P&L?
+            st.markdown("---")
+            st.markdown("**🔍 PMS Total P&L Diagnostic:**")
+            st.markdown(f"""
+            - PMS Realized P&L: ${pms_realized:,.2f}
+            - PMS Unrealized P&L: ${pms_unrealized:,.2f}
+            - PMS Income (separate): ${pms_income:,.2f}
+            - PMS Total P&L (reported): **${pms_total:,.2f}**
+
+            **Checking PMS calculation method:**
+            - If Total = Realized + Unrealized: ${pms_check_without_income:,.2f} (diff: ${pms_total - pms_check_without_income:,.2f})
+            - If Total = Realized + Unrealized + Income: ${pms_check_with_income:,.2f} (diff: ${pms_total - pms_check_with_income:,.2f})
+            """)
+
+            # Determine which matches
+            if abs(pms_total - pms_check_without_income) < 1:
+                st.warning("⚠️ **PMS does NOT include income in Total P&L** - Income is shown separately")
+                st.info(f"To match PMS: Our Total P&L should be ${float(pnl.realized_capital_gains + pnl.total_unrealized_pnl):,.2f} (excluding income)")
+            elif abs(pms_total - pms_check_with_income) < 1:
+                st.success("✅ PMS includes income in Total P&L (same as our calculation)")
+            else:
+                st.error(f"❓ PMS calculation method unclear - neither formula matches")
 
         # Count passes/fails
         passes = sum(1 for d in comparison_data if d['Status'] == '✅')
