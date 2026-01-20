@@ -44,11 +44,11 @@ class ExcelLoader:
         "security": "symbol",
         "isin": "symbol",
         "cusip": "symbol",
-        # Quantity
+        # Quantity - Note: 'quantity' column is preferred over 'nominal'
         "qty": "quantity",
         "shares": "quantity",
         "units": "quantity",
-        "nominal": "quantity",
+        # "nominal": "quantity",  # Removed - conflicts with actual 'Quantity' column in some PMS exports
         # Currency
         "trade ccy": "currency",
         "trade_ccy": "currency",
@@ -129,7 +129,7 @@ class ExcelLoader:
         "rights": "buy",  # Rights issue
         "bonus": "dividend",  # Bonus shares
         "corpact": "transfer_in",  # Corporate action
-        "ati": "interest",  # Accrued Tax Interest
+        "ati": "transfer_in",  # Accrued Transfer In / Initial position transfer
         "rtax": "fee",  # Reclaim Tax / Tax Refund
     }
 
@@ -372,12 +372,25 @@ class ExcelLoader:
         currency = CurrencyCode.from_string(str(row["currency"]))
 
         # Parse numeric fields
-        quantity = self._parse_decimal(row["quantity"])
-        price = self._parse_decimal(row["price"])
+        quantity = self._parse_decimal(row.get("quantity", 0))
+        price = self._parse_decimal(row.get("price", 0))
         commission = self._parse_decimal(row.get("commission", 0))
         fees = self._parse_decimal(row.get("fees", 0))
         taxes = self._parse_decimal(row.get("taxes", 0))
         fx_rate = self._parse_decimal(row.get("fx_rate", 1))
+
+        # Get gross_amount from file (important for dividends/income where qty=0)
+        # Try multiple column names that might contain the amount
+        gross_amount = self._parse_decimal(
+            row.get("gross_amount") or
+            row.get("trade_amount") or
+            row.get("income") or
+            row.get("trade_income") or
+            0
+        )
+
+        # Get net_amount from file
+        net_amount = self._parse_decimal(row.get("net_amount", 0))
 
         # Build transaction
         transaction = Transaction(
@@ -393,6 +406,8 @@ class ExcelLoader:
             fees=fees,
             taxes=taxes,
             fx_rate=fx_rate,
+            gross_amount=gross_amount,
+            net_amount=net_amount,
             account_id=str(row.get("account_id", "")) if pd.notna(row.get("account_id")) else None,
             cusip=str(row.get("cusip", "")) if pd.notna(row.get("cusip")) else None,
             isin=str(row.get("isin", "")) if pd.notna(row.get("isin")) else None,
