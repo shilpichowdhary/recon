@@ -77,23 +77,15 @@ def main():
         transactions_file = st.file_uploader(
             "Upload transaction file",
             type=["csv", "xlsx", "xls"],
-            help="CSV or Excel file with transaction data"
+            help="CSV or Excel file with transaction history"
         )
 
-        # PMS comparison file (optional)
-        st.subheader("2. PMS Values (Optional)")
-        pms_file = st.file_uploader(
-            "Upload PMS comparison file",
+        # Position file (contains PMS values and current prices)
+        st.subheader("2. Positions (Required for Reconciliation)")
+        positions_file = st.file_uploader(
+            "Upload positions/holdings file",
             type=["csv", "xlsx", "xls"],
-            help="Expected values from your PMS for comparison"
-        )
-
-        # Current prices file (optional)
-        st.subheader("3. Current Prices (Optional)")
-        prices_file = st.file_uploader(
-            "Upload current prices",
-            type=["csv", "xlsx", "xls"],
-            help="CSV or Excel with columns: symbol, price"
+            help="Current holdings with market prices and PMS-calculated values"
         )
 
         st.divider()
@@ -179,8 +171,7 @@ def main():
             try:
                 result = run_reconciliation(
                     transactions_file,
-                    pms_file if calc_mode == "Compare to PMS" else None,  # Ignore PMS file in Calculate Only mode
-                    prices_file,
+                    positions_file if calc_mode == "Compare to PMS" else None,
                     portfolio_id,
                     base_currency,
                     valuation_date
@@ -225,7 +216,80 @@ def main():
             st.error(f"Error reading file: {str(e)}")
 
 
-def run_reconciliation(transactions_file, pms_file, prices_file, portfolio_id, base_currency, valuation_date):
+def load_positions_file(positions_file):
+    """Load positions file and extract PMS values and current prices."""
+    if positions_file.name.endswith('.csv'):
+        df = pd.read_csv(positions_file)
+    else:
+        df = pd.read_excel(positions_file)
+
+    # Normalize column names
+    df.columns = [str(c).lower().strip() for c in df.columns]
+
+    current_prices = {}
+    pms_positions = {}
+    pms_totals = {
+        'total_market_value': Decimal('0'),
+        'total_cost_basis': Decimal('0'),
+        'total_unrealized_pnl': Decimal('0'),
+        'total_realized_pnl': Decimal('0'),
+        'total_income': Decimal('0'),
+        'total_pnl': Decimal('0'),
+    }
+
+    for _, row in df.iterrows():
+        # Get symbol
+        symbol = str(
+            row.get('instrument id') or
+            row.get('symbol') or
+            row.get('ticker') or
+            ''
+        ).upper().strip()
+
+        if not symbol:
+            continue
+
+        # Get market price
+        market_price = row.get('market price', 0)
+        if market_price and pd.notna(market_price):
+            try:
+                current_prices[symbol] = Decimal(str(market_price))
+            except:
+                pass
+
+        # Get PMS values for this position
+        quantity = Decimal(str(row.get('quantity', 0) or 0))
+        cost_value = Decimal(str(row.get('cost value (base, eod fx)') or row.get('cost value (local)') or 0))
+        market_value = Decimal(str(row.get('total market value (base)') or row.get('total market value (local)') or 0))
+        unrealized_pnl = Decimal(str(row.get('total unrealised gain / loss (base)') or row.get('unrealised gain / loss (local)') or 0))
+        realized_pnl = Decimal(str(row.get('total realised gain / loss (base)') or row.get('realised gain / loss (local)') or 0))
+        income = Decimal(str(row.get('income (received, base)') or row.get('income (received, local)') or 0))
+        total_pnl = Decimal(str(row.get('total p&l (base)') or row.get('total p&l (local)') or 0))
+        xirr_pct = row.get('xirr (%)', None)
+
+        pms_positions[symbol] = {
+            'quantity': quantity,
+            'cost_value': cost_value,
+            'market_value': market_value,
+            'unrealized_pnl': unrealized_pnl,
+            'realized_pnl': realized_pnl,
+            'income': income,
+            'total_pnl': total_pnl,
+            'xirr': Decimal(str(xirr_pct / 100)) if xirr_pct and pd.notna(xirr_pct) else None,
+        }
+
+        # Aggregate totals
+        pms_totals['total_market_value'] += market_value
+        pms_totals['total_cost_basis'] += cost_value
+        pms_totals['total_unrealized_pnl'] += unrealized_pnl
+        pms_totals['total_realized_pnl'] += realized_pnl
+        pms_totals['total_income'] += income
+        pms_totals['total_pnl'] += total_pnl
+
+    return current_prices, pms_positions, pms_totals
+
+
+def run_reconciliation(transactions_file, positions_file, portfolio_id, base_currency, valuation_date):
     """Run the reconciliation process."""
 
     # Save uploaded file to temp location
@@ -253,75 +317,34 @@ def run_reconciliation(transactions_file, pms_file, prices_file, portfolio_id, b
                     if issue.severity.value == "WARNING":
                         st.warning(f"{issue.field}: {issue.message}")
 
-        # Load current prices
+        # Load positions file (contains current prices AND PMS values)
         current_prices = {}
-        if prices_file:
-            # Handle both CSV and Excel
-            if prices_file.name.endswith('.csv'):
-                prices_df = pd.read_csv(prices_file)
-            else:
-                prices_df = pd.read_excel(prices_file)
+        pms_positions = {}
+        pms_totals = {}
 
-            # Normalize column names to lowercase
-            prices_df.columns = [str(c).lower().strip() for c in prices_df.columns]
+        if positions_file:
+            current_prices, pms_positions, pms_totals = load_positions_file(positions_file)
+            st.success(f"✅ Loaded {len(pms_positions)} positions with market prices")
 
-            for _, row in prices_df.iterrows():
-                # Try various column names for symbol
-                symbol = str(
-                    row.get('symbol') or
-                    row.get('instrument id') or
-                    row.get('ticker') or
-                    row.get('security') or
-                    ''
-                ).upper().strip()
-
-                # Try various column names for price
-                price = (
-                    row.get('price') or
-                    row.get('current price') or
-                    row.get('market price') or
-                    row.get('last price') or
-                    0
-                )
-
-                if symbol and price:
-                    try:
-                        current_prices[symbol] = Decimal(str(price))
-                    except:
-                        pass
-
-        # Use last transaction price as default for missing symbols
+        # Fallback: use last transaction price for missing symbols
         for txn in sorted(transactions, key=lambda t: t.transaction_date):
             if txn.symbol not in current_prices and txn.price and txn.price > 0:
                 current_prices[txn.symbol] = txn.price
 
-        # Load PMS expected values
-        expected_values = {}
-        if pms_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(pms_file.name).suffix) as tmp_pms:
-                tmp_pms.write(pms_file.getvalue())
-                pms_path = Path(tmp_pms.name)
-
-            try:
-                if pms_path.suffix.lower() == '.csv':
-                    pms_df = pd.read_csv(pms_path)
-                    for _, row in pms_df.iterrows():
-                        metric = str(row.get('metric', row.get('Metric', ''))).lower()
-                        value = row.get('value', row.get('Value', 0))
-                        if metric:
-                            expected_values[metric] = Decimal(str(value))
-                else:
-                    pms_loader = ExcelLoader()
-                    pms_loader.load(pms_path)
-                    expected_values = pms_loader.get_expected_values()
-            finally:
-                pms_path.unlink()
+        # Build expected values from PMS totals for reconciliation
+        expected_values = {
+            'market_value': pms_totals.get('total_market_value', Decimal('0')),
+            'cost_basis': pms_totals.get('total_cost_basis', Decimal('0')),
+            'unrealized_pnl': pms_totals.get('total_unrealized_pnl', Decimal('0')),
+            'realized_pnl': pms_totals.get('total_realized_pnl', Decimal('0')),
+            'total_pnl': pms_totals.get('total_pnl', Decimal('0')),
+        }
 
         # Run reconciliation
         recon_input = ReconciliationInput(
             transactions=transactions,
             current_prices=current_prices,
-            expected_values=expected_values,
+            expected_values=expected_values if positions_file else {},
             portfolio_id=portfolio_id,
             valuation_date=valuation_date,
             base_currency=base_currency,
@@ -346,6 +369,9 @@ def run_reconciliation(transactions_file, pms_file, prices_file, portfolio_id, b
             'lot_details': lot_details,
             'cash_flow_summary': cash_flow_summary,
             'loader_summary': loader.get_summary(),
+            'pms_positions': pms_positions,
+            'pms_totals': pms_totals,
+            'current_prices': current_prices,
         }
 
     finally:
@@ -359,46 +385,126 @@ def display_results(result):
     pnl = result['portfolio_pnl']
     summary = recon.get_summary()
     calc_mode = result.get('calc_mode', 'Calculate Only')
+    pms_totals = result.get('pms_totals', {})
 
-    # Check if we have comparison data
-    has_comparison = summary['total_checks'] > 0
+    # Check if we have PMS data
+    has_pms_data = bool(pms_totals)
 
     # Overall status based on mode
     if calc_mode == "Calculate Only":
         st.header("📊 Performance Calculation Results")
-        st.success("✅ **Calculation Complete** - Use these values to compare against your PMS data")
+        st.success("✅ **Calculation Complete** - Compare these values against your PMS")
     else:
         st.header("📊 Reconciliation Results")
-        if not has_comparison:
-            st.warning("⚠️ **No PMS comparison data provided** - Upload a PMS values file to compare.")
-        elif recon.is_fully_reconciled:
-            st.success(f"✅ **PASS** - All {summary['total_checks']} reconciliation checks passed")
+        if has_pms_data:
+            st.info("📋 Comparing calculated values against PMS position data")
         else:
-            st.error(f"❌ **FAIL** - {summary['failed']} of {summary['total_checks']} check(s) failed")
+            st.warning("⚠️ **No positions file provided** - Upload a positions file to compare against PMS values.")
 
-    # Summary metrics - show calculated values prominently
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total P&L", f"${float(pnl.total_pnl):,.2f}")
-    with col2:
-        st.metric("Realized P&L", f"${float(pnl.total_realized_pnl):,.2f}")
-    with col3:
-        st.metric("Unrealized P&L", f"${float(pnl.total_unrealized_pnl):,.2f}")
-    with col4:
-        st.metric("Positions", len(pnl.positions))
+    # Show side-by-side comparison if we have PMS data
+    if has_pms_data and calc_mode == "Compare to PMS":
+        st.subheader("📊 Calculated vs PMS Comparison")
 
-    # Show reconciliation summary if in comparison mode with data
-    if has_comparison and calc_mode == "Compare to PMS":
-        st.divider()
+        comparison_data = []
+
+        # Market Value
+        calc_mv = float(pnl.total_market_value)
+        pms_mv = float(pms_totals.get('total_market_value', 0))
+        diff_mv = calc_mv - pms_mv
+        comparison_data.append({
+            'Metric': 'Total Market Value',
+            'Calculated': f"${calc_mv:,.2f}",
+            'PMS': f"${pms_mv:,.2f}",
+            'Difference': f"${diff_mv:,.2f}",
+            'Status': '✅' if abs(diff_mv) < 1 else '❌'
+        })
+
+        # Cost Basis
+        calc_cost = float(pnl.total_cost_basis)
+        pms_cost = float(pms_totals.get('total_cost_basis', 0))
+        diff_cost = calc_cost - pms_cost
+        comparison_data.append({
+            'Metric': 'Total Cost Basis',
+            'Calculated': f"${calc_cost:,.2f}",
+            'PMS': f"${pms_cost:,.2f}",
+            'Difference': f"${diff_cost:,.2f}",
+            'Status': '✅' if abs(diff_cost) < 1 else '❌'
+        })
+
+        # Unrealized P&L
+        calc_upnl = float(pnl.total_unrealized_pnl)
+        pms_upnl = float(pms_totals.get('total_unrealized_pnl', 0))
+        diff_upnl = calc_upnl - pms_upnl
+        comparison_data.append({
+            'Metric': 'Unrealized P&L',
+            'Calculated': f"${calc_upnl:,.2f}",
+            'PMS': f"${pms_upnl:,.2f}",
+            'Difference': f"${diff_upnl:,.2f}",
+            'Status': '✅' if abs(diff_upnl) < 1 else '❌'
+        })
+
+        # Realized P&L
+        calc_rpnl = float(pnl.total_realized_pnl)
+        pms_rpnl = float(pms_totals.get('total_realized_pnl', 0))
+        diff_rpnl = calc_rpnl - pms_rpnl
+        comparison_data.append({
+            'Metric': 'Realized P&L',
+            'Calculated': f"${calc_rpnl:,.2f}",
+            'PMS': f"${pms_rpnl:,.2f}",
+            'Difference': f"${diff_rpnl:,.2f}",
+            'Status': '✅' if abs(diff_rpnl) < 1 else '❌'
+        })
+
+        # Total P&L
+        calc_tpnl = float(pnl.total_pnl)
+        pms_tpnl = float(pms_totals.get('total_pnl', 0))
+        diff_tpnl = calc_tpnl - pms_tpnl
+        comparison_data.append({
+            'Metric': 'Total P&L',
+            'Calculated': f"${calc_tpnl:,.2f}",
+            'PMS': f"${pms_tpnl:,.2f}",
+            'Difference': f"${diff_tpnl:,.2f}",
+            'Status': '✅' if abs(diff_tpnl) < 1 else '❌'
+        })
+
+        # Income
+        calc_inc = float(pnl.dividend_income + pnl.interest_income)
+        pms_inc = float(pms_totals.get('total_income', 0))
+        diff_inc = calc_inc - pms_inc
+        comparison_data.append({
+            'Metric': 'Total Income',
+            'Calculated': f"${calc_inc:,.2f}",
+            'PMS': f"${pms_inc:,.2f}",
+            'Difference': f"${diff_inc:,.2f}",
+            'Status': '✅' if abs(diff_inc) < 1 else '❌'
+        })
+
+        df_comparison = pd.DataFrame(comparison_data)
+        st.dataframe(df_comparison, use_container_width=True, hide_index=True)
+
+        # Count passes/fails
+        passes = sum(1 for d in comparison_data if d['Status'] == '✅')
+        fails = len(comparison_data) - passes
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Checks Passed", passes)
+        with col2:
+            st.metric("Checks Failed", fails)
+        with col3:
+            st.metric("Pass Rate", f"{passes/len(comparison_data)*100:.0f}%")
+
+    else:
+        # Just show calculated values
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Checks", summary['total_checks'])
+            st.metric("Total P&L", f"${float(pnl.total_pnl):,.2f}")
         with col2:
-            st.metric("Passed", summary['passed'], delta=None)
+            st.metric("Realized P&L", f"${float(pnl.total_realized_pnl):,.2f}")
         with col3:
-            st.metric("Failed", summary['failed'], delta=None, delta_color="inverse")
+            st.metric("Unrealized P&L", f"${float(pnl.total_unrealized_pnl):,.2f}")
         with col4:
-            st.metric("Pass Rate", summary['pass_rate'])
+            st.metric("Positions", len(pnl.positions))
 
     st.divider()
 
