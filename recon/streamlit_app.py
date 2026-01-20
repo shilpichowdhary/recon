@@ -92,8 +92,8 @@ def main():
         st.subheader("3. Current Prices (Optional)")
         prices_file = st.file_uploader(
             "Upload current prices",
-            type=["csv"],
-            help="CSV with columns: symbol, price"
+            type=["csv", "xlsx", "xls"],
+            help="CSV or Excel with columns: symbol, price"
         )
 
         st.divider()
@@ -256,15 +256,43 @@ def run_reconciliation(transactions_file, pms_file, prices_file, portfolio_id, b
         # Load current prices
         current_prices = {}
         if prices_file:
-            prices_df = pd.read_csv(prices_file)
+            # Handle both CSV and Excel
+            if prices_file.name.endswith('.csv'):
+                prices_df = pd.read_csv(prices_file)
+            else:
+                prices_df = pd.read_excel(prices_file)
+
+            # Normalize column names to lowercase
+            prices_df.columns = [str(c).lower().strip() for c in prices_df.columns]
+
             for _, row in prices_df.iterrows():
-                symbol = str(row.get('symbol', row.get('Symbol', ''))).upper()
-                price = row.get('price', row.get('Price', 0))
-                if symbol:
-                    current_prices[symbol] = Decimal(str(price))
-        else:
-            # Use last transaction price as default
-            for txn in sorted(transactions, key=lambda t: t.transaction_date):
+                # Try various column names for symbol
+                symbol = str(
+                    row.get('symbol') or
+                    row.get('instrument id') or
+                    row.get('ticker') or
+                    row.get('security') or
+                    ''
+                ).upper().strip()
+
+                # Try various column names for price
+                price = (
+                    row.get('price') or
+                    row.get('current price') or
+                    row.get('market price') or
+                    row.get('last price') or
+                    0
+                )
+
+                if symbol and price:
+                    try:
+                        current_prices[symbol] = Decimal(str(price))
+                    except:
+                        pass
+
+        # Use last transaction price as default for missing symbols
+        for txn in sorted(transactions, key=lambda t: t.transaction_date):
+            if txn.symbol not in current_prices and txn.price and txn.price > 0:
                 current_prices[txn.symbol] = txn.price
 
         # Load PMS expected values
